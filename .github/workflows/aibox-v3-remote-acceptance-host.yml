@@ -33,22 +33,20 @@ jobs:
           [[ -n "$EXEC_TOKEN" ]] || { echo 'missing execution registration token' >&2; exit 1; }
           mkdir -p "$RUNTIME_ROOT/pids" "$RUNTIME_ROOT/logs" "$CACHE_DIR"
 
+          slot_root_real() {
+            readlink -f "$RUNTIME_ROOT/$1"
+          }
+
           listener_pids() {
-            local slot="$1" root="$RUNTIME_ROOT/$1"
-            python3 - "$root" <<'PY'
-import os,sys
-root=os.path.realpath(sys.argv[1])
-for entry in os.listdir('/proc'):
-    if not entry.isdigit():
-        continue
-    try:
-        comm=open(f'/proc/{entry}/comm').read().strip()
-        cwd=os.path.realpath(os.readlink(f'/proc/{entry}/cwd'))
-    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
-        continue
-    if comm == 'Runner.Listener' and cwd == root:
-        print(entry)
-PY
+            local slot="$1" target proc comm cwd
+            target="$(slot_root_real "$slot")"
+            for proc in /proc/[0-9]*; do
+              [[ -r "$proc/comm" ]] || continue
+              comm="$(cat "$proc/comm" 2>/dev/null || true)"
+              [[ "$comm" == 'Runner.Listener' ]] || continue
+              cwd="$(readlink -f "$proc/cwd" 2>/dev/null || true)"
+              [[ "$cwd" == "$target" ]] && basename "$proc"
+            done
           }
 
           listener_alive() {
