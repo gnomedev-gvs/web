@@ -1,0 +1,133 @@
+name: AI BOX V3 Remote Acceptance Host
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  host:
+    if: >-
+      github.event.issue.user.login == 'gnomedev-gvs' &&
+      github.event.issue.title == '[AIBOX-V3-REMOTE-HOST] remote-01'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Host temporary private controller node
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTROL_TOKEN: ${{ secrets.AIBOX_REMOTE_ACCEPTANCE_CONTROL_TOKEN }}
+          EXEC_TOKEN: ${{ secrets.AIBOX_REMOTE_ACCEPTANCE_EXEC_TOKEN }}
+          HOST_ISSUE: ${{ github.event.issue.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONTROL_REPO='gnomedev-gvs/aibox-control'
+          CONTROL_URL="https://github.com/$CONTROL_REPO"
+          NODE_ID='remote-01'
+          RUNTIME_ROOT="$HOME/.local/share/aibox-control/remote-acceptance/$NODE_ID"
+          CACHE_DIR="$HOME/.cache/aibox-control/runner-dist"
+
+          [[ -n "$CONTROL_TOKEN" ]] || { echo 'missing control registration token' >&2; exit 1; }
+          [[ -n "$EXEC_TOKEN" ]] || { echo 'missing execution registration token' >&2; exit 1; }
+          mkdir -p "$RUNTIME_ROOT/pids" "$RUNTIME_ROOT/logs" "$CACHE_DIR"
+
+          cleanup() {
+            set +e
+            for slot in exec-01 control-01; do
+              pidfile="$RUNTIME_ROOT/pids/$slot.pid"
+              if [[ -s "$pidfile" ]]; then
+                pid="$(cat "$pidfile")"
+                if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+                  kill -INT "$pid" 2>/dev/null || true
+                  for _ in $(seq 1 10); do
+                    kill -0 "$pid" 2>/dev/null || break
+                    sleep 1
+                  done
+                  kill -TERM "$pid" 2>/dev/null || true
+                fi
+              fi
+            done
+            gh issue comment "$HOST_ISSUE" --repo "$GITHUB_REPOSITORY" --body "REMOTE_NODE_STOPPED node=$NODE_ID host=$(hostname)" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT INT TERM
+
+          echo '[remote-host] resolving GitHub Actions runner release'
+          tag="$(gh api repos/actions/runner/releases/latest --jq '.tag_name')"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "unexpected runner release tag: $tag" >&2; exit 1; }
+          ver="${tag#v}"
+          asset="actions-runner-linux-x64-${ver}.tar.gz"
+          archive="$CACHE_DIR/$asset"
+          if [[ ! -s "$archive" ]]; then
+            tmp="$(mktemp)"
+            curl -fL --retry 3 --retry-delay 2 --connect-timeout 15 \
+              "https://github.com/actions/runner/releases/download/${tag}/${asset}" -o "$tmp"
+            digest="$(gh api repos/actions/runner/releases/latest --jq ".assets[] | select(.name == \"${asset}\") | .digest // empty")"
+            [[ "$digest" == sha256:* ]] || { echo 'runner asset digest unavailable' >&2; exit 1; }
+            expected="${digest#sha256:}"
+            actual="$(sha256sum "$tmp" | awk '{print $1}')"
+            [[ "$expected" == "$actual" ]] || { echo 'runner archive SHA-256 mismatch' >&2; exit 1; }
+            mv "$tmp" "$archive"
+          fi
+
+          configure_slot() {
+            local slot="$1"
+            local token="$2"
+            local runner_name="$3"
+            local labels="$4"
+            local root="$RUNTIME_ROOT/$slot"
+            rm -rf "$root"
+            mkdir -p "$root"
+            tar xzf "$archive" -C "$root"
+            (
+              cd "$root"
+              ./config.sh --unattended --replace --url "$CONTROL_URL" --token "$token" \
+                --name "$runner_name" --labels "$labels" --work '_work'
+            )
+          }
+
+          start_slot() {
+            local slot="$1"
+            local root="$RUNTIME_ROOT/$slot"
+            local pidfile="$RUNTIME_ROOT/pids/$slot.pid"
+            local logfile="$RUNTIME_ROOT/logs/$slot.log"
+            (
+              cd "$root"
+              env -u GH_TOKEN -u GITHUB_TOKEN -u CONTROL_TOKEN -u EXEC_TOKEN \
+                AIBOX_NODE_ID="$NODE_ID" \
+                AIBOX_REMOTE_ACCEPTANCE_ROOT="$RUNTIME_ROOT" \
+                ./run.sh >>"$logfile" 2>&1 &
+              echo $! > "$pidfile"
+            )
+          }
+
+          alive() {
+            local pidfile="$1"
+            [[ -s "$pidfile" ]] || return 1
+            local pid
+            pid="$(cat "$pidfile")"
+            [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+            kill -0 "$pid" 2>/dev/null
+          }
+
+          configure_slot control-01 "$CONTROL_TOKEN" "ghvm-${GITHUB_RUN_ID}-control-01" "omk-control,aibox-control,node-$NODE_ID,omk-node-admin"
+          configure_slot exec-01 "$EXEC_TOKEN" "ghvm-${GITHUB_RUN_ID}-$NODE_ID-exec-01" "omk-exec,node-$NODE_ID,class-heavy,class-standard,class-light,cap-general-compute,cap-runner-admin"
+          unset CONTROL_TOKEN EXEC_TOKEN
+
+          start_slot control-01
+          start_slot exec-01
+          sleep 5
+          alive "$RUNTIME_ROOT/pids/control-01.pid" || { echo 'control listener failed to stay alive' >&2; exit 1; }
+          alive "$RUNTIME_ROOT/pids/exec-01.pid" || { echo 'execution listener failed to stay alive' >&2; exit 1; }
+
+          gh issue comment "$HOST_ISSUE" --repo "$GITHUB_REPOSITORY" --body "REMOTE_NODE_READY node=$NODE_ID host=$(hostname) control=control-01 exec=exec-01" >/dev/null
+          echo '[remote-host] remote-01 ready'
+
+          for _ in $(seq 1 300); do
+            alive "$RUNTIME_ROOT/pids/control-01.pid" || { echo 'control listener exited unexpectedly' >&2; exit 1; }
+            alive "$RUNTIME_ROOT/pids/exec-01.pid" || { echo 'execution listener exited unexpectedly' >&2; exit 1; }
+            sleep 5
+          done
