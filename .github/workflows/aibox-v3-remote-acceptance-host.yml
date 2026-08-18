@@ -1,18 +1,17 @@
 name: AI BOX V3 Remote Acceptance Host
 
 on:
-  issues:
-    types: [opened]
+  push:
+    branches: [18.0]
+    paths:
+      - '.aibox-v3-remote-trigger'
 
 permissions:
   contents: read
-  issues: write
 
 jobs:
   host:
-    if: >-
-      github.event.issue.user.login == 'gnomedev-gvs' &&
-      github.event.issue.title == '[AIBOX-V3-REMOTE-HOST] remote-01'
+    if: github.actor == 'gnomedev-gvs'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -21,7 +20,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           CONTROL_TOKEN: ${{ secrets.AIBOX_REMOTE_ACCEPTANCE_CONTROL_TOKEN }}
           EXEC_TOKEN: ${{ secrets.AIBOX_REMOTE_ACCEPTANCE_EXEC_TOKEN }}
-          HOST_ISSUE: ${{ github.event.issue.number }}
         shell: bash
         run: |
           set -euo pipefail
@@ -51,7 +49,6 @@ jobs:
                 fi
               fi
             done
-            gh issue comment "$HOST_ISSUE" --repo "$GITHUB_REPOSITORY" --body "REMOTE_NODE_STOPPED node=$NODE_ID host=$(hostname)" >/dev/null 2>&1 || true
           }
           trap cleanup EXIT INT TERM
 
@@ -123,8 +120,7 @@ jobs:
           alive "$RUNTIME_ROOT/pids/control-01.pid" || { echo 'control listener failed to stay alive' >&2; exit 1; }
           alive "$RUNTIME_ROOT/pids/exec-01.pid" || { echo 'execution listener failed to stay alive' >&2; exit 1; }
 
-          gh issue comment "$HOST_ISSUE" --repo "$GITHUB_REPOSITORY" --body "REMOTE_NODE_READY node=$NODE_ID host=$(hostname) control=control-01 exec=exec-01" >/dev/null
-          echo '[remote-host] remote-01 ready'
+          echo "REMOTE_NODE_READY node=$NODE_ID host=$(hostname) control=control-01 exec=exec-01"
 
           for _ in $(seq 1 300); do
             alive "$RUNTIME_ROOT/pids/control-01.pid" || { echo 'control listener exited unexpectedly' >&2; exit 1; }
