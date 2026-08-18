@@ -33,18 +33,56 @@ jobs:
           [[ -n "$EXEC_TOKEN" ]] || { echo 'missing execution registration token' >&2; exit 1; }
           mkdir -p "$RUNTIME_ROOT/pids" "$RUNTIME_ROOT/logs" "$CACHE_DIR"
 
+          listener_pids() {
+            local slot="$1" root="$RUNTIME_ROOT/$1"
+            python3 - "$root" <<'PY'
+import os,sys
+root=os.path.realpath(sys.argv[1])
+for entry in os.listdir('/proc'):
+    if not entry.isdigit():
+        continue
+    try:
+        comm=open(f'/proc/{entry}/comm').read().strip()
+        cwd=os.path.realpath(os.readlink(f'/proc/{entry}/cwd'))
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+        continue
+    if comm == 'Runner.Listener' and cwd == root:
+        print(entry)
+PY
+          }
+
+          listener_alive() {
+            [[ -n "$(listener_pids "$1")" ]]
+          }
+
+          wrapper_alive() {
+            local pidfile="$RUNTIME_ROOT/pids/$1.pid" pid
+            [[ -s "$pidfile" ]] || return 1
+            pid="$(cat "$pidfile")"
+            [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null
+          }
+
+          slot_alive() {
+            listener_alive "$1" || wrapper_alive "$1"
+          }
+
           cleanup() {
             set +e
             for slot in exec-01 control-01; do
+              while read -r pid; do
+                [[ -n "$pid" ]] && kill -INT "$pid" 2>/dev/null || true
+              done < <(listener_pids "$slot")
               pidfile="$RUNTIME_ROOT/pids/$slot.pid"
               if [[ -s "$pidfile" ]]; then
                 pid="$(cat "$pidfile")"
-                if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
-                  kill -INT "$pid" 2>/dev/null || true
-                  sleep 2
-                  kill -TERM "$pid" 2>/dev/null || true
-                fi
+                [[ "$pid" =~ ^[0-9]+$ ]] && kill -INT "$pid" 2>/dev/null || true
               fi
+            done
+            sleep 2
+            for slot in exec-01 control-01; do
+              while read -r pid; do
+                [[ -n "$pid" ]] && kill -TERM "$pid" 2>/dev/null || true
+              done < <(listener_pids "$slot")
             done
           }
           trap cleanup EXIT INT TERM
@@ -77,6 +115,7 @@ jobs:
 
           start_slot() {
             local slot="$1" root="$RUNTIME_ROOT/$1" pidfile="$RUNTIME_ROOT/pids/$1.pid" logfile="$RUNTIME_ROOT/logs/$1.log"
+            rm -f "$pidfile"
             (
               cd "$root"
               env -u GH_TOKEN -u GITHUB_TOKEN -u CONTROL_TOKEN -u EXEC_TOKEN \
@@ -86,11 +125,23 @@ jobs:
             )
           }
 
-          alive() {
-            local pidfile="$1" pid
-            [[ -s "$pidfile" ]] || return 1
-            pid="$(cat "$pidfile")"
-            [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null
+          wait_slot() {
+            local slot="$1"
+            for _ in $(seq 1 15); do
+              slot_alive "$slot" && return 0
+              sleep 1
+            done
+            return 1
+          }
+
+          restore_slot() {
+            local slot="$1"
+            if ! slot_alive "$slot"; then
+              echo "REMOTE_NODE_RECOVERY slot=$slot action=restart"
+              start_slot "$slot"
+              wait_slot "$slot" || { echo "failed to restore $slot" >&2; return 1; }
+              echo "REMOTE_NODE_RECOVERY slot=$slot result=restored"
+            fi
           }
 
           configure_slot control-01 "$CONTROL_TOKEN" "ghvm-${GITHUB_RUN_ID}-control-01" "omk-control,aibox-control,node-$NODE_ID,omk-node-admin"
@@ -99,11 +150,12 @@ jobs:
 
           start_slot control-01
           start_slot exec-01
-          sleep 5
-          alive "$RUNTIME_ROOT/pids/control-01.pid" || { echo 'control listener failed initial startup' >&2; exit 1; }
-          alive "$RUNTIME_ROOT/pids/exec-01.pid" || { echo 'execution listener failed initial startup' >&2; exit 1; }
+          wait_slot control-01 || { echo 'control listener failed initial startup' >&2; exit 1; }
+          wait_slot exec-01 || { echo 'execution listener failed initial startup' >&2; exit 1; }
           echo "REMOTE_NODE_READY node=$NODE_ID host=$(hostname) control=control-01 exec=exec-01"
 
-          # run.sh is a bootstrap wrapper and may hand off to Runner.Listener.
-          # Keep the outer hosted job alive; GitHub owns and cleans the tagged child listeners.
-          sleep 1500
+          for _ in $(seq 1 750); do
+            restore_slot control-01
+            restore_slot exec-01
+            sleep 2
+          done
